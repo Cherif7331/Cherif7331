@@ -48,4 +48,59 @@ class InPlays:
         print("Initiating request to Bet365 API...")
         try:
             # Send a GET request to the API
-            response = self.session.g
+            response = self.session.get(self.api_url or "", headers=self.headers, timeout=60)
+            response.raise_for_status()  # Raise an error for HTTP status codes >= 400
+            print("Received response from Bet365 API.")
+
+            # Process the response content
+            data = response.text.split('EV')
+            set_array = []
+            for item in data:
+                if 'Futebol' in item and 'Ao-Vivo' in item:  # Filter for live football events
+                    format_data = {
+                        'CL': self.extract_data(item, 'CL', 'CI'),
+                        'CI': self.extract_data(item, 'CI', 'NA'),
+                        'NA': self.extract_data(item, 'NA', 'VI'),
+                        'SM': self.extract_data(item, 'SM', 'CN'),
+                        'CB': self.extract_data(item, 'CB', 'C1'),
+                        'C1': self.extract_data(item, 'C1', 'C2'),
+                        'C2': self.extract_data(item, 'C2', 'C3'),
+                        'C3': self.extract_data(item, 'C3', 'T1'),
+                        'T1': self.extract_data(item, 'T1', 'T2'),
+                        'T2': self.extract_data(item, 'T2', 'T3'),
+                        'T3': self.extract_data(item, 'T3', 'CR')
+                    }
+                    set_array.append(format_data)
+            print("Data processed successfully.")
+            return set_array
+
+        except requests.exceptions.HTTPError as http_err:
+            print(f'HTTP error occurred: {http_err}')
+            return None
+        except requests.exceptions.ConnectionError as conn_err:
+            print(f'Connection error occurred: {conn_err}')
+            return None
+        except requests.exceptions.Timeout as timeout_err:
+            print(f'Timeout error occurred: {timeout_err}')
+            return None
+        except requests.exceptions.RequestException as req_err:
+            print(f'Unexpected error occurred: {req_err}')
+            return None
+
+    @staticmethod
+    def extract_data(item, start, end):
+        try:
+            # Extracts substring between the given start and end markers
+            start_idx = item.index(start) + len(start) + 1
+            end_idx = item.index(end) - 1
+            return item[start_idx:end_idx]
+        except ValueError:
+            print(f"Failed to extract data between {start} and {end}")
+            return None
+
+if __name__ == "__main__":
+    # Run the main InPlays data extraction process
+    in_plays = InPlays()
+    print("Starting InPlays process...")
+    result = in_plays.on()
+    print("Result:", result)
