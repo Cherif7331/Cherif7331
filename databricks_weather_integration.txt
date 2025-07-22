@@ -1,0 +1,897 @@
+# ===============================================================================
+# DATABRICKS WEATHER INTEGRATION - PHILADELPHIA SCANRATE PREDICTION
+# National Weather Service API Integration for Machine Learning
+# 
+# Copy and paste each section into separate Databricks cells
+# ===============================================================================
+
+# CELL 1: INSTALLATION AND IMPORTS
+# ===============================================================================
+# Install required packages (run this first)
+%pip install requests pandas numpy
+
+# Import all required libraries
+import requests
+import json
+import logging
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configure logging for Databricks
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+print("✅ Packages installed and imported successfully!")
+print("✅ Ready for weather data integration")
+
+# ===============================================================================
+# CELL 2: WEATHER INTEGRATION CLASS
+# ===============================================================================
+
+class WeatherIntegration:
+    """
+    Enhanced Weather Integration class for Philadelphia scanrate prediction.
+    Optimized for Databricks environment and machine learning workflows.
+    """
+    
+    def __init__(self, user_agent: str = "ScanratePrediction/2.0 (databricks-ml@yourcompany.com)"):
+        """Initialize the weather integration client."""
+        # NWS API Configuration
+        self.base_url = "https://api.weather.gov"
+        self.headers = {"User-Agent": user_agent}
+        
+        # Philadelphia specific configuration (from API exploration)
+        self.location = {
+            'name': 'Philadelphia, PA',
+            'latitude': 39.9526,
+            'longitude': -75.1652,
+            'grid_office': 'PHI',
+            'grid_x': 50,
+            'grid_y': 76,
+            'primary_station': 'KPHL',  # Philadelphia International Airport
+            'timezone': 'America/New_York'
+        }
+        
+        # Additional stations for data validation/backup
+        self.backup_stations = ['KPNE', 'KLOM', 'KEWR', 'KBWI']
+        
+        # Cache for reducing API calls
+        self._cache = {}
+        self._cache_timeout = 300  # 5 minutes
+        
+        logger.info(f"Weather Integration initialized for {self.location['name']}")
+        logger.info(f"Primary station: {self.location['primary_station']}")
+        logger.info(f"Grid: {self.location['grid_office']}/{self.location['grid_x']},{self.location['grid_y']}")
+    
+    def get_current_conditions(self, station_id: str = None) -> Optional[Dict]:
+        """Get current weather conditions optimized for scanrate prediction."""
+        station = station_id or self.location['primary_station']
+        cache_key = f"current_{station}"
+        
+        # Check cache
+        if self._is_cached(cache_key):
+            logger.debug(f"Returning cached current conditions for {station}")
+            return self._cache[cache_key]['data']
+        
+        url = f"{self.base_url}/stations/{station}/observations/latest"
+        
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract and format data for scanrate prediction model
+            props = data['properties']
+            
+            current_conditions = {
+                # Core identifiers
+                'timestamp': props['timestamp'],
+                'station_id': station,
+                'collection_time': datetime.utcnow().isoformat(),
+                
+                # Temperature data (critical for scanrate)
+                'temperature_c': self._safe_extract(props, 'temperature'),
+                'temperature_f': self._celsius_to_fahrenheit(self._safe_extract(props, 'temperature')),
+                'dewpoint_c': self._safe_extract(props, 'dewpoint'),
+                'heat_index_c': self._safe_extract(props, 'heatIndex'),
+                'wind_chill_c': self._safe_extract(props, 'windChill'),
+                'apparent_temp_c': self._safe_extract(props, 'heatIndex') or self._safe_extract(props, 'windChill'),
+                
+                # Humidity (affects scanning conditions)
+                'relative_humidity': self._safe_extract(props, 'relativeHumidity'),
+                
+                # Wind data (critical for outdoor scanning)
+                'wind_speed_kmh': self._safe_extract(props, 'windSpeed'),
+                'wind_speed_mph': self._kmh_to_mph(self._safe_extract(props, 'windSpeed')),
+                'wind_direction_deg': self._safe_extract(props, 'windDirection'),
+                'wind_direction_cardinal': self._degrees_to_cardinal(self._safe_extract(props, 'windDirection')),
+                'wind_gust_kmh': self._safe_extract(props, 'windGust'),
+                'wind_gust_mph': self._kmh_to_mph(self._safe_extract(props, 'windGust')),
+                
+                # Atmospheric pressure (affects equipment)
+                'pressure_pa': self._safe_extract(props, 'barometricPressure'),
+                'pressure_inhg': self._pa_to_inhg(self._safe_extract(props, 'barometricPressure')),
+                'sea_level_pressure_pa': self._safe_extract(props, 'seaLevelPressure'),
+                
+                # Visibility and precipitation (scanning conditions)
+                'visibility_m': self._safe_extract(props, 'visibility'),
+                'visibility_mi': self._meters_to_miles(self._safe_extract(props, 'visibility')),
+                'precipitation_1hr_mm': self._safe_extract(props, 'precipitationLastHour'),
+                'precipitation_3hr_mm': self._safe_extract(props, 'precipitationLast3Hours'),
+                'precipitation_6hr_mm': self._safe_extract(props, 'precipitationLast6Hours'),
+                
+                # Weather description
+                'weather_description': props.get('textDescription', ''),
+                'weather_icon': props.get('icon', ''),
+                'present_weather': props.get('presentWeather', []),
+                
+                # Cloud conditions
+                'cloud_layers': props.get('cloudLayers', []),
+                
+                # Data quality
+                'data_quality': self._assess_data_quality(props),
+                'raw_metar': props.get('rawMessage', '')
+            }
+            
+            # Cache the result
+            self._cache[cache_key] = {
+                'data': current_conditions,
+                'timestamp': time.time()
+            }
+            
+            logger.info(f"Successfully retrieved current conditions from {station}")
+            return current_conditions
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching current conditions from {station}: {e}")
+            
+            # Try backup station if primary fails
+            if station == self.location['primary_station'] and self.backup_stations:
+                logger.info("Attempting backup station...")
+                for backup in self.backup_stations:
+                    result = self.get_current_conditions(backup)
+                    if result:
+                        logger.info(f"Successfully retrieved data from backup station {backup}")
+                        return result
+            
+            return None
+    
+    def get_historical_observations(self, 
+                                  hours_back: int = 24, 
+                                  station_id: str = None,
+                                  start_date: datetime = None,
+                                  end_date: datetime = None) -> List[Dict]:
+        """Get historical weather observations for model training."""
+        station = station_id or self.location['primary_station']
+        
+        # Set date range
+        if start_date and end_date:
+            start_time = start_date
+            end_time = end_date
+        else:
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(hours=hours_back)
+        
+        url = f"{self.base_url}/stations/{station}/observations"
+        params = {
+            'start': start_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'end': end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        }
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            observations = []
+            for feature in data['features']:
+                props = feature['properties']
+                
+                # Format each observation similarly to current conditions
+                obs = {
+                    'timestamp': props['timestamp'],
+                    'station_id': station,
+                    'temperature_c': self._safe_extract(props, 'temperature'),
+                    'dewpoint_c': self._safe_extract(props, 'dewpoint'),
+                    'relative_humidity': self._safe_extract(props, 'relativeHumidity'),
+                    'wind_speed_kmh': self._safe_extract(props, 'windSpeed'),
+                    'wind_direction_deg': self._safe_extract(props, 'windDirection'),
+                    'wind_gust_kmh': self._safe_extract(props, 'windGust'),
+                    'pressure_pa': self._safe_extract(props, 'barometricPressure'),
+                    'visibility_m': self._safe_extract(props, 'visibility'),
+                    'precipitation_1hr_mm': self._safe_extract(props, 'precipitationLastHour'),
+                    'weather_description': props.get('textDescription', ''),
+                    'data_quality': self._assess_data_quality(props)
+                }
+                observations.append(obs)
+            
+            logger.info(f"Retrieved {len(observations)} historical observations from {station}")
+            return observations
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching historical observations from {station}: {e}")
+            return []
+    
+    def get_forecast_data(self, detailed: bool = True) -> Optional[Dict]:
+        """Get forecast data optimized for scanrate prediction models."""
+        cache_key = f"forecast_{'detailed' if detailed else 'hourly'}"
+        
+        # Check cache
+        if self._is_cached(cache_key):
+            logger.debug("Returning cached forecast data")
+            return self._cache[cache_key]['data']
+        
+        if detailed:
+            url = f"{self.base_url}/gridpoints/{self.location['grid_office']}/{self.location['grid_x']},{self.location['grid_y']}"
+        else:
+            url = f"{self.base_url}/gridpoints/{self.location['grid_office']}/{self.location['grid_x']},{self.location['grid_y']}/forecast/hourly"
+        
+        try:
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            if detailed:
+                # Process detailed grid data
+                props = data['properties']
+                forecast_data = {
+                    'update_time': props['updateTime'],
+                    'valid_times': props['validTimes'],
+                    'grid_info': {
+                        'office': self.location['grid_office'],
+                        'grid_x': self.location['grid_x'],
+                        'grid_y': self.location['grid_y']
+                    },
+                    # Extract time series for scanrate-relevant parameters
+                    'temperature': self._extract_time_series(props.get('temperature', {})),
+                    'dewpoint': self._extract_time_series(props.get('dewpoint', {})),
+                    'humidity': self._extract_time_series(props.get('relativeHumidity', {})),
+                    'wind_speed': self._extract_time_series(props.get('windSpeed', {})),
+                    'wind_direction': self._extract_time_series(props.get('windDirection', {})),
+                    'wind_gust': self._extract_time_series(props.get('windGust', {})),
+                    'precipitation_probability': self._extract_time_series(props.get('probabilityOfPrecipitation', {})),
+                    'precipitation_amount': self._extract_time_series(props.get('quantitativePrecipitation', {})),
+                    'pressure': self._extract_time_series(props.get('pressure', {})),
+                    'sky_cover': self._extract_time_series(props.get('skyCover', {})),
+                    'visibility': self._extract_time_series(props.get('visibility', {})),
+                    'apparent_temperature': self._extract_time_series(props.get('apparentTemperature', {}))
+                }
+            else:
+                # Process hourly forecast data
+                forecast_data = {
+                    'update_time': data['properties']['updateTime'],
+                    'periods': []
+                }
+                
+                for period in data['properties']['periods']:
+                    period_data = {
+                        'start_time': period['startTime'],
+                        'end_time': period['endTime'],
+                        'temperature_f': period['temperature'],
+                        'temperature_c': self._fahrenheit_to_celsius(period['temperature']),
+                        'wind_speed': period['windSpeed'],
+                        'wind_direction': period['windDirection'],
+                        'short_forecast': period['shortForecast'],
+                        'detailed_forecast': period.get('detailedForecast', ''),
+                        'precipitation_probability': period.get('probabilityOfPrecipitation', {}).get('value'),
+                        'humidity': period.get('relativeHumidity', {}).get('value'),
+                        'dewpoint': period.get('dewpoint', {}).get('value')
+                    }
+                    forecast_data['periods'].append(period_data)
+            
+            # Cache the result
+            self._cache[cache_key] = {
+                'data': forecast_data,
+                'timestamp': time.time()
+            }
+            
+            logger.info(f"Successfully retrieved {'detailed' if detailed else 'hourly'} forecast data")
+            return forecast_data
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching forecast data: {e}")
+            return None
+    
+    def get_scanrate_optimized_data(self) -> Dict:
+        """Get weather data specifically optimized for scanrate prediction."""
+        logger.info("Collecting scanrate-optimized weather data...")
+        
+        # Get current conditions
+        current = self.get_current_conditions()
+        
+        # Get next 6 hours of detailed forecasts
+        forecast = self.get_forecast_data(detailed=True)
+        
+        # Get recent 6 hours of observations for trend analysis
+        recent = self.get_historical_observations(hours_back=6)
+        
+        scanrate_data = {
+            'collection_timestamp': datetime.utcnow().isoformat(),
+            'location': self.location,
+            'current_conditions': current,
+            'recent_trend': self._calculate_trends(recent),
+            'forecast_next_6hrs': self._extract_next_hours(forecast, 6) if forecast else None,
+            'scanrate_factors': self._calculate_scanrate_factors(current, recent, forecast),
+            'data_quality_score': self._calculate_overall_quality(current, recent, forecast)
+        }
+        
+        logger.info("Scanrate-optimized data collection complete")
+        return scanrate_data
+    
+    def to_dataframe(self, data_type: str = 'current') -> pd.DataFrame:
+        """Convert weather data to pandas DataFrame for ML processing."""
+        if data_type == 'current':
+            current = self.get_current_conditions()
+            if current:
+                # Flatten the data for DataFrame
+                flat_data = {}
+                for key, value in current.items():
+                    if isinstance(value, (int, float, str)) and not isinstance(value, list):
+                        flat_data[key] = [value]
+                return pd.DataFrame(flat_data)
+        
+        elif data_type == 'historical':
+            historical = self.get_historical_observations(hours_back=24)
+            if historical:
+                return pd.DataFrame(historical)
+        
+        elif data_type == 'forecast':
+            forecast = self.get_forecast_data(detailed=False)
+            if forecast and 'periods' in forecast:
+                return pd.DataFrame(forecast['periods'])
+        
+        return pd.DataFrame()  # Return empty DataFrame if no data
+    
+    # Helper methods for data processing and conversion
+    def _safe_extract(self, props: Dict, key: str) -> Optional[float]:
+        """Safely extract numeric value from weather properties."""
+        try:
+            value_dict = props.get(key, {})
+            if isinstance(value_dict, dict):
+                return value_dict.get('value')
+            return value_dict
+        except (KeyError, TypeError):
+            return None
+    
+    def _extract_time_series(self, data_dict: Dict) -> List[Dict]:
+        """Extract time series values from NWS grid data format."""
+        if not data_dict or 'values' not in data_dict:
+            return []
+        
+        time_series = []
+        for item in data_dict['values']:
+            time_series.append({
+                'valid_time': item['validTime'],
+                'value': item['value']
+            })
+        
+        return time_series
+    
+    def _extract_next_hours(self, forecast_data: Dict, hours: int) -> List[Dict]:
+        """Extract next N hours of forecast data."""
+        if not forecast_data or 'temperature' not in forecast_data:
+            return []
+        
+        # Take first N points from each parameter
+        next_hours = []
+        temp_data = forecast_data['temperature'][:hours]
+        
+        for i, temp in enumerate(temp_data):
+            hour_data = {
+                'valid_time': temp['valid_time'],
+                'temperature': temp['value']
+            }
+            
+            # Add other parameters if available
+            for param in ['humidity', 'wind_speed', 'wind_direction', 'precipitation_probability']:
+                if param in forecast_data and i < len(forecast_data[param]):
+                    hour_data[param] = forecast_data[param][i]['value']
+            
+            next_hours.append(hour_data)
+        
+        return next_hours
+    
+    def _calculate_trends(self, recent_data: List[Dict]) -> Dict:
+        """Calculate weather trends from recent observations."""
+        if not recent_data or len(recent_data) < 2:
+            return {}
+        
+        # Sort by timestamp
+        sorted_data = sorted(recent_data, key=lambda x: x['timestamp'])
+        
+        trends = {}
+        
+        # Calculate temperature trend
+        temps = [obs['temperature_c'] for obs in sorted_data if obs['temperature_c'] is not None]
+        if len(temps) >= 2:
+            trends['temperature_trend'] = temps[-1] - temps[0]
+            trends['temperature_rate'] = trends['temperature_trend'] / len(temps)
+        
+        # Calculate pressure trend
+        pressures = [obs['pressure_pa'] for obs in sorted_data if obs['pressure_pa'] is not None]
+        if len(pressures) >= 2:
+            trends['pressure_trend'] = pressures[-1] - pressures[0]
+            trends['pressure_rate'] = trends['pressure_trend'] / len(pressures)
+        
+        # Calculate wind trend
+        winds = [obs['wind_speed_kmh'] for obs in sorted_data if obs['wind_speed_kmh'] is not None]
+        if len(winds) >= 2:
+            trends['wind_trend'] = winds[-1] - winds[0]
+            trends['wind_rate'] = trends['wind_trend'] / len(winds)
+        
+        return trends
+    
+    def _calculate_scanrate_factors(self, current: Dict, recent: List[Dict], forecast: Dict) -> Dict:
+        """Calculate factors that specifically affect scanrate performance."""
+        factors = {}
+        
+        if current:
+            # Temperature factor (extreme temps affect scanning)
+            temp = current.get('temperature_c')
+            if temp is not None:
+                if temp < 0:
+                    factors['temperature_factor'] = 'very_cold'
+                elif temp < 10:
+                    factors['temperature_factor'] = 'cold'
+                elif temp > 35:
+                    factors['temperature_factor'] = 'very_hot'
+                elif temp > 30:
+                    factors['temperature_factor'] = 'hot'
+                else:
+                    factors['temperature_factor'] = 'optimal'
+            
+            # Wind factor (affects outdoor scanning)
+            wind = current.get('wind_speed_kmh')
+            if wind is not None:
+                if wind > 40:
+                    factors['wind_factor'] = 'very_high'
+                elif wind > 25:
+                    factors['wind_factor'] = 'high'
+                elif wind > 15:
+                    factors['wind_factor'] = 'moderate'
+                else:
+                    factors['wind_factor'] = 'low'
+            
+            # Humidity factor (affects equipment)
+            humidity = current.get('relative_humidity')
+            if humidity is not None:
+                if humidity > 90:
+                    factors['humidity_factor'] = 'very_high'
+                elif humidity > 70:
+                    factors['humidity_factor'] = 'high'
+                elif humidity < 30:
+                    factors['humidity_factor'] = 'low'
+                else:
+                    factors['humidity_factor'] = 'normal'
+            
+            # Precipitation factor
+            precip = current.get('precipitation_1hr_mm')
+            if precip is not None and precip > 0:
+                factors['precipitation_factor'] = 'active'
+            else:
+                factors['precipitation_factor'] = 'none'
+        
+        return factors
+    
+    def _assess_data_quality(self, props: Dict) -> str:
+        """Assess the quality of weather data."""
+        quality_indicators = 0
+        total_checks = 0
+        
+        # Check for presence of key fields
+        key_fields = ['temperature', 'dewpoint', 'windSpeed', 'barometricPressure', 'relativeHumidity']
+        for field in key_fields:
+            total_checks += 1
+            if props.get(field, {}).get('value') is not None:
+                quality_indicators += 1
+        
+        if total_checks == 0:
+            return 'unknown'
+        
+        quality_ratio = quality_indicators / total_checks
+        
+        if quality_ratio >= 0.8:
+            return 'high'
+        elif quality_ratio >= 0.6:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _calculate_overall_quality(self, current: Dict, recent: List[Dict], forecast: Dict) -> float:
+        """Calculate overall data quality score (0-1)."""
+        quality_score = 0.0
+        weight_sum = 0.0
+        
+        # Current data quality (weight: 0.5)
+        if current and current.get('data_quality'):
+            quality_map = {'high': 1.0, 'medium': 0.7, 'low': 0.4, 'unknown': 0.2}
+            quality_score += quality_map.get(current['data_quality'], 0.2) * 0.5
+            weight_sum += 0.5
+        
+        # Recent data availability (weight: 0.3)
+        if recent:
+            recent_quality = len(recent) / 6.0  # Expecting 6 hours of data
+            quality_score += min(recent_quality, 1.0) * 0.3
+            weight_sum += 0.3
+        
+        # Forecast data availability (weight: 0.2)
+        if forecast:
+            quality_score += 1.0 * 0.2
+            weight_sum += 0.2
+        
+        return quality_score / weight_sum if weight_sum > 0 else 0.0
+    
+    def _is_cached(self, key: str) -> bool:
+        """Check if data is cached and still valid."""
+        if key not in self._cache:
+            return False
+        
+        age = time.time() - self._cache[key]['timestamp']
+        return age < self._cache_timeout
+    
+    # Unit conversion helpers
+    def _celsius_to_fahrenheit(self, celsius: Optional[float]) -> Optional[float]:
+        """Convert Celsius to Fahrenheit."""
+        return (celsius * 9/5) + 32 if celsius is not None else None
+    
+    def _fahrenheit_to_celsius(self, fahrenheit: Optional[float]) -> Optional[float]:
+        """Convert Fahrenheit to Celsius."""
+        return (fahrenheit - 32) * 5/9 if fahrenheit is not None else None
+    
+    def _kmh_to_mph(self, kmh: Optional[float]) -> Optional[float]:
+        """Convert km/h to mph."""
+        return kmh * 0.621371 if kmh is not None else None
+    
+    def _pa_to_inhg(self, pa: Optional[float]) -> Optional[float]:
+        """Convert Pascals to inches of mercury."""
+        return pa * 0.0002953 if pa is not None else None
+    
+    def _meters_to_miles(self, meters: Optional[float]) -> Optional[float]:
+        """Convert meters to miles."""
+        return meters * 0.000621371 if meters is not None else None
+    
+    def _degrees_to_cardinal(self, degrees: Optional[float]) -> Optional[str]:
+        """Convert wind direction degrees to cardinal direction."""
+        if degrees is None:
+            return None
+        
+        directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                     "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        index = round(degrees / 22.5) % 16
+        return directions[index]
+
+print("✅ WeatherIntegration class defined successfully!")
+
+# ===============================================================================
+# CELL 3: INITIALIZE AND TEST WEATHER INTEGRATION
+# ===============================================================================
+
+# Initialize the weather integration
+weather = WeatherIntegration("ScanratePrediction-Databricks/1.0 (ml-team@yourcompany.com)")
+
+# Test the integration
+print("🌤️  Testing Weather Integration...")
+print("=" * 60)
+
+# Get current conditions
+current_conditions = weather.get_current_conditions()
+if current_conditions:
+    print("✅ Current Conditions Retrieved:")
+    print(f"   🌡️  Temperature: {current_conditions['temperature_c']:.1f}°C ({current_conditions['temperature_f']:.1f}°F)")
+    print(f"   💨 Wind: {current_conditions['wind_speed_kmh']:.1f} km/h {current_conditions['wind_direction_cardinal']}")
+    print(f"   💧 Humidity: {current_conditions['relative_humidity']:.1f}%")
+    print(f"   🏭 Pressure: {current_conditions['pressure_inhg']:.2f} inHg")
+    print(f"   👁️  Visibility: {current_conditions['visibility_mi']:.1f} miles")
+    print(f"   ☁️  Weather: {current_conditions['weather_description']}")
+    print(f"   ✅ Data Quality: {current_conditions['data_quality']}")
+else:
+    print("❌ Failed to retrieve current conditions")
+
+print("\n" + "=" * 60)
+print("✅ Weather Integration Ready for Machine Learning!")
+
+# ===============================================================================
+# CELL 4: DATA COLLECTION FOR ML MODELS
+# ===============================================================================
+
+# Get scanrate-optimized weather data
+print("🎯 Collecting Scanrate-Optimized Weather Data...")
+scanrate_data = weather.get_scanrate_optimized_data()
+
+# Display scanrate factors
+if scanrate_data['scanrate_factors']:
+    factors = scanrate_data['scanrate_factors']
+    print("\n🔍 Environmental Factors Affecting Scanrate:")
+    print(f"   🌡️  Temperature Factor: {factors.get('temperature_factor', 'unknown')}")
+    print(f"   💨 Wind Factor: {factors.get('wind_factor', 'unknown')}")
+    print(f"   💧 Humidity Factor: {factors.get('humidity_factor', 'unknown')}")
+    print(f"   🌧️  Precipitation Factor: {factors.get('precipitation_factor', 'unknown')}")
+
+# Show data quality score
+print(f"\n📊 Overall Data Quality Score: {scanrate_data['data_quality_score']:.2f}")
+
+# Show weather trends
+if scanrate_data['recent_trend']:
+    trends = scanrate_data['recent_trend']
+    print(f"\n📈 Recent Weather Trends (last 6 hours):")
+    if 'temperature_trend' in trends:
+        print(f"   🌡️  Temperature: {trends['temperature_trend']:+.1f}°C change")
+    if 'pressure_trend' in trends:
+        print(f"   🏭 Pressure: {trends['pressure_trend']:+.0f} Pa change")
+    if 'wind_trend' in trends:
+        print(f"   💨 Wind Speed: {trends['wind_trend']:+.1f} km/h change")
+
+print("\n✅ Scanrate data collection complete!")
+
+# ===============================================================================
+# CELL 5: CONVERT TO DATAFRAMES FOR ML PROCESSING
+# ===============================================================================
+
+# Convert current conditions to DataFrame
+print("📊 Converting Weather Data to DataFrames...")
+
+# Current conditions DataFrame
+current_df = weather.to_dataframe('current')
+if not current_df.empty:
+    print("✅ Current Conditions DataFrame:")
+    print(f"   Shape: {current_df.shape}")
+    print(f"   Columns: {list(current_df.columns)}")
+    display(current_df.head())
+
+# Historical observations DataFrame
+historical_df = weather.to_dataframe('historical')
+if not historical_df.empty:
+    print(f"\n✅ Historical Observations DataFrame (last 24 hours):")
+    print(f"   Shape: {historical_df.shape}")
+    print(f"   Columns: {list(historical_df.columns)}")
+    display(historical_df.head())
+
+# Forecast DataFrame
+forecast_df = weather.to_dataframe('forecast')
+if not forecast_df.empty:
+    print(f"\n✅ Forecast DataFrame:")
+    print(f"   Shape: {forecast_df.shape}")
+    print(f"   Columns: {list(forecast_df.columns)}")
+    display(forecast_df.head())
+
+print("\n✅ DataFrames ready for machine learning processing!")
+
+# ===============================================================================
+# CELL 6: FEATURE ENGINEERING FOR SCANRATE PREDICTION
+# ===============================================================================
+
+def create_scanrate_features(weather_df):
+    """
+    Create engineered features for scanrate prediction from weather data.
+    """
+    if weather_df.empty:
+        return weather_df
+    
+    # Create a copy to avoid modifying original
+    df = weather_df.copy()
+    
+    # Temperature-based features
+    if 'temperature_c' in df.columns:
+        df['temp_extreme'] = ((df['temperature_c'] < 0) | (df['temperature_c'] > 35)).astype(int)
+        df['temp_optimal'] = ((df['temperature_c'] >= 15) & (df['temperature_c'] <= 25)).astype(int)
+        df['temp_cold'] = (df['temperature_c'] < 10).astype(int)
+        df['temp_hot'] = (df['temperature_c'] > 30).astype(int)
+    
+    # Wind-based features
+    if 'wind_speed_kmh' in df.columns:
+        df['wind_high'] = (df['wind_speed_kmh'] > 25).astype(int)
+        df['wind_moderate'] = ((df['wind_speed_kmh'] > 15) & (df['wind_speed_kmh'] <= 25)).astype(int)
+        df['wind_calm'] = (df['wind_speed_kmh'] <= 10).astype(int)
+    
+    # Humidity-based features
+    if 'relative_humidity' in df.columns:
+        df['humidity_high'] = (df['relative_humidity'] > 70).astype(int)
+        df['humidity_very_high'] = (df['relative_humidity'] > 90).astype(int)
+        df['humidity_low'] = (df['relative_humidity'] < 30).astype(int)
+    
+    # Pressure-based features
+    if 'pressure_pa' in df.columns:
+        df['pressure_normalized'] = df['pressure_pa'] / 101325  # Normalize to standard atmospheric pressure
+    
+    # Visibility-based features
+    if 'visibility_m' in df.columns:
+        df['visibility_poor'] = (df['visibility_m'] < 1000).astype(int)
+        df['visibility_excellent'] = (df['visibility_m'] > 10000).astype(int)
+    
+    # Precipitation features
+    if 'precipitation_1hr_mm' in df.columns:
+        df['has_precipitation'] = (df['precipitation_1hr_mm'] > 0).astype(int)
+    
+    # Comfort index (combination of temperature and humidity)
+    if 'temperature_c' in df.columns and 'relative_humidity' in df.columns:
+        # Simple comfort index calculation
+        df['comfort_index'] = (
+            (df['temperature_c'].between(18, 24)) & 
+            (df['relative_humidity'].between(40, 60))
+        ).astype(int)
+    
+    # Scanning condition score (0-100)
+    score_components = []
+    
+    if 'temp_optimal' in df.columns:
+        score_components.append(df['temp_optimal'] * 25)
+    if 'wind_calm' in df.columns:
+        score_components.append(df['wind_calm'] * 25)
+    if 'humidity_high' in df.columns:
+        score_components.append((1 - df['humidity_high']) * 25)
+    if 'has_precipitation' in df.columns:
+        score_components.append((1 - df['has_precipitation']) * 25)
+    
+    if score_components:
+        df['scanning_condition_score'] = sum(score_components)
+    
+    return df
+
+# Apply feature engineering to historical data
+if not historical_df.empty:
+    print("🔧 Engineering Features for Scanrate Prediction...")
+    
+    # Create features
+    historical_features_df = create_scanrate_features(historical_df)
+    
+    print("✅ Feature Engineering Complete!")
+    print(f"   Original columns: {len(historical_df.columns)}")
+    print(f"   Enhanced columns: {len(historical_features_df.columns)}")
+    print(f"   New features added: {len(historical_features_df.columns) - len(historical_df.columns)}")
+    
+    # Show sample of new features
+    feature_columns = [col for col in historical_features_df.columns if col not in historical_df.columns]
+    print(f"\n🆕 New Features: {feature_columns}")
+    
+    if feature_columns:
+        display(historical_features_df[['timestamp'] + feature_columns[:5]].head())
+
+print("\n✅ Feature engineering ready for ML model training!")
+
+# ===============================================================================
+# CELL 7: AUTOMATED DATA COLLECTION FUNCTION
+# ===============================================================================
+
+def collect_weather_data_for_ml(hours_back=48, include_forecast=True):
+    """
+    Automated function to collect and prepare weather data for ML models.
+    
+    Args:
+        hours_back: Number of hours of historical data to collect
+        include_forecast: Whether to include forecast data
+    
+    Returns:
+        dict: Dictionary containing processed DataFrames and metadata
+    """
+    
+    print(f"🚀 Starting automated weather data collection...")
+    print(f"   📅 Historical data: {hours_back} hours")
+    print(f"   🔮 Include forecast: {include_forecast}")
+    
+    # Initialize weather integration
+    weather = WeatherIntegration()
+    
+    # Collect data
+    results = {
+        'collection_timestamp': datetime.utcnow().isoformat(),
+        'location': weather.location,
+        'data_quality_score': 0.0,
+        'current_conditions': None,
+        'historical_data': None,
+        'forecast_data': None,
+        'scanrate_factors': None,
+        'feature_engineered_data': None
+    }
+    
+    try:
+        # Get current conditions
+        print("📊 Collecting current conditions...")
+        current = weather.get_current_conditions()
+        if current:
+            results['current_conditions'] = pd.DataFrame([current])
+            print("   ✅ Current conditions collected")
+        
+        # Get historical data
+        print(f"📈 Collecting {hours_back} hours of historical data...")
+        historical = weather.get_historical_observations(hours_back=hours_back)
+        if historical:
+            historical_df = pd.DataFrame(historical)
+            results['historical_data'] = historical_df
+            
+            # Apply feature engineering
+            print("🔧 Applying feature engineering...")
+            results['feature_engineered_data'] = create_scanrate_features(historical_df)
+            print("   ✅ Historical data and features ready")
+        
+        # Get forecast data
+        if include_forecast:
+            print("🔮 Collecting forecast data...")
+            forecast = weather.get_forecast_data(detailed=False)
+            if forecast and 'periods' in forecast:
+                results['forecast_data'] = pd.DataFrame(forecast['periods'])
+                print("   ✅ Forecast data collected")
+        
+        # Get scanrate factors
+        if current:
+            print("🎯 Calculating scanrate factors...")
+            scanrate_data = weather.get_scanrate_optimized_data()
+            results['scanrate_factors'] = scanrate_data['scanrate_factors']
+            results['data_quality_score'] = scanrate_data['data_quality_score']
+            print("   ✅ Scanrate factors calculated")
+        
+        print(f"\n🎉 Data collection complete!")
+        print(f"   📊 Data quality score: {results['data_quality_score']:.2f}")
+        
+        return results
+        
+    except Exception as e:
+        print(f"❌ Error during data collection: {e}")
+        return results
+
+# Run automated data collection
+ml_data = collect_weather_data_for_ml(hours_back=24, include_forecast=True)
+
+# Display summary
+print("\n📋 Data Collection Summary:")
+for key, value in ml_data.items():
+    if isinstance(value, pd.DataFrame):
+        print(f"   {key}: DataFrame with shape {value.shape}")
+    elif isinstance(value, dict):
+        print(f"   {key}: {len(value)} items")
+    else:
+        print(f"   {key}: {type(value).__name__}")
+
+print("\n✅ All weather data ready for machine learning model development!")
+
+# ===============================================================================
+# CELL 8: SAVE DATA TO DATABRICKS TABLES (OPTIONAL)
+# ===============================================================================
+
+# Uncomment and modify the following code to save data to Databricks tables
+
+"""
+# Save current conditions to Delta table
+if ml_data['current_conditions'] is not None:
+    (ml_data['current_conditions']
+     .write
+     .format("delta")
+     .mode("append")
+     .option("mergeSchema", "true")
+     .saveAsTable("weather.current_conditions"))
+    print("✅ Current conditions saved to weather.current_conditions table")
+
+# Save historical data to Delta table
+if ml_data['feature_engineered_data'] is not None:
+    (ml_data['feature_engineered_data']
+     .write
+     .format("delta")
+     .mode("append")
+     .option("mergeSchema", "true")
+     .saveAsTable("weather.historical_observations"))
+    print("✅ Historical data saved to weather.historical_observations table")
+
+# Save forecast data to Delta table
+if ml_data['forecast_data'] is not None:
+    (ml_data['forecast_data']
+     .write
+     .format("delta")
+     .mode("append")
+     .option("mergeSchema", "true")
+     .saveAsTable("weather.forecast_data"))
+    print("✅ Forecast data saved to weather.forecast_data table")
+
+print("✅ All data saved to Databricks Delta tables!")
+"""
+
+print("💾 Data saving code ready (uncomment to use)")
+print("✅ Weather integration setup complete!")
+
+# ===============================================================================
+# END OF DATABRICKS WEATHER INTEGRATION
+# Copy each cell above into separate Databricks cells for best results
+# ===============================================================================
